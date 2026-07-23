@@ -12,10 +12,13 @@ from .base import BSF
 from .vanilla import VanillaBSF
 from .grassmannian import GrassmannianBSF
 from .group_lasso import GroupLassoBSF
-from .train import train, recon_r2
-from . import data, viz
+from .train import train, fit, recon_r2
+from .sources import ActivationSource, VisionSource, CapturesSource
+from . import data, viz, sources, capture_format, normalize
 
 __all__ = [
     'BSF', 'VanillaBSF', 'GrassmannianBSF', 'GroupLassoBSF',
-    'train', 'recon_r2', 'data', 'viz',
+    'train', 'fit', 'recon_r2',
+    'ActivationSource', 'VisionSource', 'CapturesSource',
+    'data', 'viz', 'sources', 'capture_format', 'normalize',
 ]
