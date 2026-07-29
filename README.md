@@ -76,6 +76,41 @@ bsf.viz.plot_concepts(z, atoms, images, top, grid, n_img=10)
 
 ---
 
+## Concept Dashboard
+
+Explore what a trained featurizer learned. `bsf analyze` builds one
+self-contained artifact; `bsf dashboard` serves an interactive Dash app over it.
+
+```bash
+pip install "bsf[dashboard]"
+
+bsf analyze --ckpt runs/gl_l32.pt --data /captures/pile25m \
+    --layer 32 --hook post_block --n-groups 4096 --group-size 4 \
+    --gguf ~/Models/Model.gguf --requests 300 --out runs/analysis_l32.npz
+
+bsf dashboard --analysis runs/analysis_l32.npz --port 8050
+# remote:  ssh -L 8050:localhost:8050 <host>
+```
+
+Four linked views, all following one selected concept: a **concept map** (spectral
+layout of the strong co-activation graph), **top-activating tokens** in context,
+the concept's **3D firing manifold**, and ranked **subspace / co-firing
+relations** with firing-rate statistics.
+
+Note on the map: a BSF concept is a `group_size`-dim *subspace*, so relations are
+chordal distances between subspaces. But an overcomplete dictionary
+(`n_groups*group_size > d`) forces those subspaces near-orthogonal — measured on a
+4096x4 dictionary at d=5120, the median pairwise distance is 1.9971 of a maximum
+2.0 and two dimensions capture only 0.63% of the variance. So the map lays out the
+*co-activation graph* instead, where the structure actually is, while chordal
+distance is kept for the nearest-neighbour lists (its tail is where near-duplicate
+concepts live). See [`docs/features/concept_dashboard.md`](docs/features/concept_dashboard.md).
+
+Reading an artifact needs only numpy + plotly + dash — no torch, no GPU, no access
+to the original captures.
+
+---
+
 ## Notebooks
 
 Three end-to-end starter notebooks, one per featurizer variant:

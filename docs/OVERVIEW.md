@@ -23,9 +23,20 @@ Overview:
     capture: >
       An async client that drives already-running vLLM servers to collect
       activations to a shared filesystem root (read back by the captures source).
+    analysis: >
+      Turns a trained checkpoint + capture root into one self-contained, versioned
+      .npz: chordal distances between concept subspaces, firing statistics,
+      top-activating tokens with decoded context, per-concept firing manifolds,
+      and the strong co-activation graph. Torch is needed to build an artifact,
+      never to read one.
+    dashboard: >
+      A Dash/plotly app over an analysis artifact -- concept map, token examples,
+      3D concept manifold, ranked subspace/co-firing relations -- all driven by one
+      selected concept. Optional extra; its imports are deferred.
     cli: >
-      `bsf train` and `bsf capture`; train reads torchrun env vars so bare /
-      single-node-multi-GPU / multi-node all use one code path.
+      `bsf train`, `bsf capture`, `bsf analyze`, `bsf dashboard`; train reads
+      torchrun env vars so bare / single-node-multi-GPU / multi-node all use one
+      code path.
   data_flow: >
     (capture) prompts -> vLLM servers (--capture-consumers filesystem:root=...)
     -> {root}/{tag}/... .bin/.json shards.
@@ -48,6 +59,14 @@ Features Index:
     entry_points: [bsf.train.fit, bsf.distributed, bsf.group_lasso]
     depends_on: [activation_sources]
     doc: docs/features/distributed_training.md
+  concept_dashboard:
+    description: >
+      `bsf analyze` + `bsf dashboard` -- interactive exploration of learned
+      concepts: co-activation-graph map, top-activating tokens, 3D concept
+      manifolds, chordal-subspace neighbours.
+    entry_points: [bsf.analysis.build.build_analysis, bsf.analysis.Analysis, bsf.dashboard.build_app]
+    depends_on: [activation_sources, distributed_training]
+    doc: docs/features/concept_dashboard.md
   capture_cli:
     description: CLI (`bsf train` / `bsf capture`) incl. driving vLLM servers to capture.
     entry_points: [bsf.cli, bsf.capture_client]
