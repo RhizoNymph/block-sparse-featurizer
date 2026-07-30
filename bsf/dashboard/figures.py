@@ -35,6 +35,33 @@ def _axes(fig, **kw):
     return fig
 
 
+def connected(an, g):
+    """Concepts sharing a co-activation edge with ``g``, strongest first.
+
+    These are the partners the map's edges actually encode, so they -- not the
+    chordal neighbours -- are what the map highlights.
+    """
+    if not len(an.edges):
+        return np.zeros(0, dtype=int), np.zeros(0, dtype=np.float32)
+    a, b = an.edges[:, 0], an.edges[:, 1]
+    inc = (a == g) | (b == g)
+    if not inc.any():
+        return np.zeros(0, dtype=int), np.zeros(0, dtype=np.float32)
+    partners = np.where(a[inc] == g, b[inc], a[inc])
+    weights = np.asarray(an.edge_weight)[inc]
+    order = np.argsort(-weights)
+    return partners[order].astype(int), weights[order]
+
+
+def _edge_xy(e, edges):
+    """Flatten edges into None-separated polyline coordinates for one trace."""
+    ex, ey = [], []
+    for a, b in edges:
+        ex += [e[a, 0], e[b, 0], None]
+        ey += [e[a, 1], e[b, 1], None]
+    return ex, ey
+
+
 def concept_map(an, selected=None, color_by='fire_rate', highlight=()):
     """The global view: every concept placed by chordal subspace distance.
 
@@ -55,15 +82,25 @@ def concept_map(an, selected=None, color_by='fire_rate', highlight=()):
              for g, t in enumerate(top)]
 
     fig = go.Figure()
-    # strong co-firing edges first, so nodes draw on top of them
+    # Edges first so nodes draw over them. The selection's own edges are split into
+    # their own trace and drawn in the accent colour, so "what connects to this
+    # concept" is answerable at a glance rather than by reading the bar chart.
+    partners = np.zeros(0, dtype=int)
     if an.meta.embedding_method == 'graph' and len(an.edges):
-        ex, ey = [], []
-        for a, b in an.edges:
-            ex += [e[a, 0], e[b, 0], None]
-            ey += [e[a, 1], e[b, 1], None]
+        inc = np.zeros(len(an.edges), dtype=bool)
+        if selected is not None:
+            a, b = an.edges[:, 0], an.edges[:, 1]
+            inc = (a == selected) | (b == selected)
+            partners, _ = connected(an, selected)
+        bx, by = _edge_xy(e, an.edges[~inc])
         fig.add_trace(go.Scattergl(
-            x=ex, y=ey, mode='lines', hoverinfo='skip', name='co-firing',
-            line=dict(color='rgba(120,140,170,0.22)', width=1)))
+            x=bx, y=by, mode='lines', hoverinfo='skip', name='co-firing',
+            line=dict(color='rgba(120,140,170,0.18)', width=1)))
+        if inc.any():
+            ix, iy = _edge_xy(e, an.edges[inc])
+            fig.add_trace(go.Scattergl(
+                x=ix, y=iy, mode='lines', hoverinfo='skip', name='connected',
+                line=dict(color='rgba(232,131,58,0.85)', width=2)))
     fig.add_trace(go.Scattergl(
         x=e[:, 0], y=e[:, 1], mode='markers', name='concepts',
         marker=dict(size=5, color=c, colorscale='Viridis', opacity=0.75,
@@ -87,6 +124,10 @@ def concept_map(an, selected=None, color_by='fire_rate', highlight=()):
     if m.embedding_method == 'graph':
         sub = (f'co-activation graph · {len(an.edges)} of {m.coact_edges_found} '
                f'edges at Jaccard≥{m.coact_threshold:g}')
+        if selected is not None:
+            sub += (f'  ·  concept {selected}: {len(partners)} connected'
+                    if len(partners) else
+                    f'  ·  concept {selected} has no edges at this threshold')
     else:
         # be explicit that a chordal map is near-meaningless for this geometry
         sub = (f'{m.embedding_method} on chordal distance · 2D captures only '
@@ -172,4 +213,40 @@ def stats_hist(an, g=None):
     return fig
 
 
-__all__ = ['concept_map', 'concept_manifold', 'neighbor_bars', 'stats_hist']
+def act_profile(an, g):
+    """One concept's activation distribution, with the band cuts marked.
+
+    The point of this chart: if the median sits far below the max, the concept's
+    *typical* firing is near-threshold and carries none of its identity -- so the
+    top-k examples above are unrepresentative of what the concept usually does.
+    """
+    q = an.act_quantiles[g]
+    if not np.any(q):
+        return _empty('never fired')
+    lo, p25, p50, p75, hi = (float(v) for v in q)
+    near = float(an.near_threshold_frac[g])
+
+    fig = go.Figure()
+    # the full firing range, with the interquartile span emphasised
+    fig.add_trace(go.Scatter(x=[lo, hi], y=[0, 0], mode='lines',
+                             line=dict(color=DIM, width=4), hoverinfo='skip'))
+    fig.add_trace(go.Scatter(x=[p25, p75], y=[0, 0], mode='lines',
+                             line=dict(color=ACCENT, width=12), hoverinfo='skip'))
+    for x, lab in ((lo, 'min'), (p50, 'median'), (hi, 'max')):
+        fig.add_trace(go.Scatter(
+            x=[x], y=[0], mode='markers+text', text=[lab], textposition='top center',
+            marker=dict(size=9, color='white', line=dict(color=ACCENT, width=2)),
+            hovertemplate=f'{lab} {x:.1f}<extra></extra>'))
+    # the 40%-of-max line: below it, tokens are empirically uninformative
+    cut = 0.4 * hi
+    fig.add_vline(x=cut, line=dict(color=FG, width=1, dash='dot'))
+    fig = _axes(fig, height=170,
+                title=f'activation profile — median is {100*p50/max(hi,1e-9):.0f}% '
+                      f'of max · {near*100:.0f}% of firings below 40% of max')
+    fig.update_yaxes(visible=False, range=[-1, 1])
+    fig.update_xaxes(title='block activation', range=[0, hi * 1.08])
+    return fig
+
+
+__all__ = ['concept_map', 'concept_manifold', 'neighbor_bars', 'stats_hist',
+           'act_profile']

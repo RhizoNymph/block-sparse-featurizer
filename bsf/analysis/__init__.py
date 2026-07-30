@@ -5,13 +5,13 @@ full analysis over a capture root; ``types`` is the on-disk contract the
 dashboard reads (numpy only -- no torch needed to view an artifact).
 """
 from .types import (
-    Analysis, Meta, ConceptExample, ARTIFACT_VERSION,
+    Analysis, Meta, ConceptExample, ConceptBand, ARTIFACT_VERSION,
     AnalysisError, ArtifactVersionError, ArtifactShapeError,
     CheckpointMismatchError,
 )
 
 __all__ = [
-    'Analysis', 'Meta', 'ConceptExample', 'ARTIFACT_VERSION',
+    'Analysis', 'Meta', 'ConceptExample', 'ConceptBand', 'ARTIFACT_VERSION',
     'AnalysisError', 'ArtifactVersionError', 'ArtifactShapeError',
     'CheckpointMismatchError',
 ]

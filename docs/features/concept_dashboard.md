@@ -5,15 +5,40 @@ Turning a trained BSF into something a human can explore: `bsf analyze` builds a
 self-contained artifact from a checkpoint plus a capture root, and
 `bsf dashboard` serves an interactive Dash app over it.
 
-Four views, all driven by a single selected concept:
+Five views, all driven by a single selected concept:
 1. **Concept map** — every concept placed by a spectral layout of the strong
-   co-activation graph, with edges drawn and the selection's neighbours ringed.
-2. **Top-activating tokens** — the tokens that fire the concept hardest, in
-   context, with the firing token highlighted.
-3. **Concept manifold** — the concept's firing cloud PCA'd to 3D, hue from radial
+   co-activation graph. The selection's own edges are drawn in the accent colour
+   and the concepts they lead to are ringed.
+2. **Activation profile** — the concept's firing range with its interquartile span
+   and a 40%-of-max marker, captioned with how skewed it is.
+3. **Token examples**, in two modes: **activation bands** (default) and top-k only.
+4. **Concept manifold** — the concept's firing cloud PCA'd to 3D, hue from radial
    direction (the same convention as `bsf.viz`), one point per firing token.
-4. **Relations + stats** — ranked nearest subspaces (chordal) and co-firing
+5. **Relations + stats** — ranked nearest subspaces (chordal) and co-firing
    partners (Jaccard), plus the corpus firing-rate distribution.
+
+## Why examples are shown by activation band
+Top-k activating examples are the standard way to read a feature, and on this
+dictionary they are **misleading on their own**: they are the extreme tail of a
+concept's firings, so a concept can look clean at the top and mean nothing at its
+typical activation. Measured on the trained layer-32 dictionary:
+
+| quantity | value |
+|---|---|
+| median concept's median firing, as a fraction of its own max | **0.35** |
+| concepts whose median firing is below 40% of max | **68%** |
+| median share of a concept's firings below 40% of max | **~0.53** |
+
+Below roughly 40% of max the tokens carry no consistent meaning. So the artifact
+stores four rank windows per concept -- `top`, `p75`, `p50`, `p10` -- and the UI
+dims any band whose ceiling falls under 40% of max and marks it *likely noise*.
+Concrete example: concept 3086 is `snoozing`/`slept`/`sleep` at the top and
+` time`/` off`/` suite` by rank 61, with 88% of its firings near threshold --
+coherent in its top ~2% only. Concept 142 (coordination: `and`/`or` plus the
+following token) stays coherent from rank 0 to rank 2000.
+
+Bands come from a UNIFORM pass over every firing, not the top-k heap, because a
+verdict about typicality must not be built from the tail.
 
 ## Non-scope
 - Training or capturing (see `distributed_training`, `capture_cli`).
@@ -58,10 +83,17 @@ used the map's title states the measured 2D variance so it cannot mislead.
 1. `bsf analyze` loads the checkpoint (`_model_from_checkpoint` validates its
    geometry against `--n-groups/--group-size`, raising `CheckpointMismatchError`),
    plus cached normalization stats for the `(layer, hook)`.
-2. One streaming pass over the first `--requests` capture units accumulates, per
-   concept: fire count, activation sum/max, a bounded top-k heap of the strongest
-   `(activation, unit, position)` triples, a subsample of firing contributions for
-   the manifold, and the boolean gate matrix.
+2. One streaming pass over the first `--requests` capture units records EVERY
+   firing as flat `(concept, activation, unit, position)` arrays (~n*L0 rows per
+   unit; ~24MB over 300 units). That is what makes exact per-concept activation
+   quantiles and the bands possible, and it replaced a per-concept numpy argsort
+   that dominated runtime -- 300 requests went from >18 min (unfinished) to ~70s.
+   Manifold clouds store the `(k,)` CODE, never the `(d,)` contribution: every
+   contribution of concept g is `z_g @ atoms_g`, so the cloud lives in that
+   concept's own k-dim subspace and the isometry into 3D is applied once at the
+   end from the atoms' SVD (`_cloud_to_3d`). That is a ~1280x memory saving
+   (15GB -> 13MB at 300 units) and is EXACT, not an approximation -- see
+   `test_cloud_to_3d_matches_full_dimensional_pca`.
 3. Geometry: chordal distances -> nearest neighbours + `embedding_quality`;
    gate matrix -> `coactivation` (top-k partners) and `coactivation_graph`
    (thresholded edges) -> `graph_layout` (spectral layout of the giant component,
@@ -76,15 +108,15 @@ used the map's title states the measured 2D variance so it cannot mislead.
    map-click / index box / token search -> `dcc.Store` -> every panel.
 
 ## Related files
-- `bsf/analysis/types.py` — `Analysis`, `Meta`, `ConceptExample`, the typed error
+- `bsf/analysis/types.py` — `Analysis`, `Meta`, `ConceptExample`, `ConceptBand`, the typed error
   hierarchy (`AnalysisError`, `ArtifactVersionError`, `ArtifactShapeError`,
   `CheckpointMismatchError`), `save`/`load`/`validate`, `ARTIFACT_VERSION`.
 - `bsf/analysis/compute.py` — `orthonormal_bases`, `chordal_distances`,
   `nearest_neighbors`, `coactivation`, `coactivation_graph`, `graph_layout`,
   `embedding_quality`, `embed_distances`.
 - `bsf/analysis/build.py` — `build_analysis`, `load_gguf_vocab`, `clean_token`.
-- `bsf/dashboard/figures.py` — `concept_map`, `concept_manifold`,
-  `neighbor_bars`, `stats_hist` (plotly only, no torch).
+- `bsf/dashboard/figures.py` — `concept_map`, `concept_manifold`, `neighbor_bars`,
+  `stats_hist`, `act_profile`, `connected` (plotly only, no torch).
 - `bsf/dashboard/app.py` — `build_app`: layout + callbacks.
 - `bsf/cli.py` — `_cmd_analyze`, `_cmd_dashboard`, `_add_analyze_args`,
   `_add_dashboard_args`.
@@ -107,6 +139,13 @@ used the map's title states the measured 2D variance so it cannot mislead.
   `dash`/`plotly` import so `bsf train` works without the extra installed.
 - Artifacts are versioned; a mismatch raises `ArtifactVersionError` rather than
   mis-rendering.
+- `act_quantiles` is `[min, p25, p50, p75, max]` per concept and `validate`
+  enforces that it is non-decreasing.
+- The two dashboard rows are CSS **grid**, not flex-wrap: `flex: 1 1 52%` plus
+  `1 1 48%` plus a gap exceeds 100%, and flex wrapping is decided on flex-basis
+  before shrinking, so the right panel always wrapped onto its own line. The
+  grid template and its media query are injected via `index_string` because
+  inline styles cannot express a media query.
 
 ## Usage
 ```

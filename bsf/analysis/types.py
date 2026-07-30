@@ -21,7 +21,7 @@ from dataclasses import dataclass, field, asdict
 import numpy as np
 
 # Bumped whenever the on-disk layout changes incompatibly.
-ARTIFACT_VERSION = 2
+ARTIFACT_VERSION = 3
 
 
 class AnalysisError(Exception):
@@ -75,6 +75,25 @@ class ConceptExample:
 
 
 @dataclass(frozen=True)
+class ConceptBand:
+    """Examples drawn from one activation band of a concept's firing distribution.
+
+    Top-k examples alone are the extreme tail of a concept's firings and make an
+    incoherent concept look clean (and vice versa). Measured on a trained
+    dictionary, the median concept's median firing sits at ~39% of its own max and
+    ~53% of its firings fall below 40% of max -- i.e. about half of every
+    concept's activity is near-threshold and carries none of its identity. These
+    bands expose that directly.
+    """
+    label: str            # 'top' | 'p75' | 'p50' | 'p10'
+    lo_act: float         # activation range covered by this band
+    hi_act: float
+    rank_lo: int          # rank window within the concept's sorted firings
+    rank_hi: int
+    examples: list        # list[ConceptExample]
+
+
+@dataclass(frozen=True)
 class Meta:
     """Everything needed to interpret the arrays, and to reproduce the run."""
     version: int
@@ -119,10 +138,17 @@ class Analysis:
     # (G, P, 3) PCA of each concept's firing cloud + (G, P) token ids into vocab
     manifold_xyz: np.ndarray
     manifold_token_ids: np.ndarray
+    # (G, 5) firing-activation quantiles [min, p25, p50, p75, max]; zeros if never
+    # fired. Drives the skew readout: how much of a concept sits near threshold.
+    act_quantiles: np.ndarray
+    # (G,) fraction of a concept's firings below 40% of its own max
+    near_threshold_frac: np.ndarray
     # shared decoded-token table; manifold_token_ids indexes this
     vocab: list = field(default_factory=list)
-    # per-concept top-activating examples
+    # per-concept top-activating examples (the 'top' band, kept for the token view)
     examples: list = field(default_factory=list)
+    # per-concept activation-stratified bands: list[list[ConceptBand]]
+    bands: list = field(default_factory=list)
 
     # ---------------------------------------------------------------- validate
     def validate(self):
@@ -161,6 +187,19 @@ class Analysis:
                                      self.manifold_xyz.shape[:2])
         if len(self.examples) != G:
             raise ArtifactShapeError('examples', (len(self.examples),), (G,))
+        if self.act_quantiles.shape != (G, 5):
+            raise ArtifactShapeError('act_quantiles', self.act_quantiles.shape, (G, 5))
+        if self.near_threshold_frac.shape != (G,):
+            raise ArtifactShapeError('near_threshold_frac',
+                                     self.near_threshold_frac.shape, (G,))
+        if self.bands and len(self.bands) != G:
+            raise ArtifactShapeError('bands', (len(self.bands),), (G,))
+        # quantiles must be non-decreasing across [min, p25, p50, p75, max]
+        q = self.act_quantiles
+        if q.size and np.any(np.diff(q, axis=1) < -1e-3):
+            bad = int(np.argmax(np.any(np.diff(q, axis=1) < -1e-3, axis=1)))
+            raise AnalysisError(
+                f'act_quantiles not monotonic for concept {bad}: {q[bad].tolist()}')
         # chordal distance is bounded by sqrt(group_size)
         hi = float(np.sqrt(self.meta.group_size)) + 1e-3
         if self.neighbor_dist.size and (self.neighbor_dist.min() < -1e-6
@@ -177,6 +216,7 @@ class Analysis:
             'meta': asdict(self.meta),
             'vocab': self.vocab,
             'examples': [[asdict(e) for e in per] for per in self.examples],
+            'bands': [[asdict(b) for b in per] for per in self.bands],
         }
         np.savez_compressed(
             path,
@@ -193,6 +233,8 @@ class Analysis:
             max_act=self.max_act.astype(np.float32),
             manifold_xyz=self.manifold_xyz.astype(np.float16),
             manifold_token_ids=self.manifold_token_ids.astype(np.int32),
+            act_quantiles=self.act_quantiles.astype(np.float32),
+            near_threshold_frac=self.near_threshold_frac.astype(np.float32),
         )
 
     @classmethod
@@ -218,15 +260,20 @@ class Analysis:
                 max_act=z['max_act'],
                 manifold_xyz=z['manifold_xyz'].astype(np.float32),
                 manifold_token_ids=z['manifold_token_ids'],
+                act_quantiles=z['act_quantiles'],
+                near_threshold_frac=z['near_threshold_frac'],
                 vocab=list(blob['vocab']),
                 examples=[[ConceptExample(**e) for e in per]
                           for per in blob['examples']],
+                bands=[[ConceptBand(**{**b, 'examples':
+                                       [ConceptExample(**e) for e in b['examples']]})
+                        for b in per] for per in blob.get('bands', [])],
             )
         return obj.validate()
 
 
 __all__ = [
-    'ARTIFACT_VERSION', 'Analysis', 'Meta', 'ConceptExample',
+    'ARTIFACT_VERSION', 'Analysis', 'Meta', 'ConceptExample', 'ConceptBand',
     'AnalysisError', 'ArtifactVersionError', 'ArtifactShapeError',
     'CheckpointMismatchError',
 ]

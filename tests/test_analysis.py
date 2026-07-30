@@ -12,7 +12,7 @@ import torch
 
 from bsf.analysis import compute as C
 from bsf.analysis.types import (
-    Analysis, Meta, ConceptExample, ARTIFACT_VERSION,
+    Analysis, Meta, ConceptExample, ConceptBand, ARTIFACT_VERSION,
     ArtifactVersionError, ArtifactShapeError, AnalysisError,
 )
 
@@ -240,8 +240,15 @@ def _toy_analysis(G=4, k=2, P=3, n_neighbors=2):
         max_act=rng.random(G),
         manifold_xyz=rng.normal(size=(G, P, 3)),
         manifold_token_ids=rng.integers(0, 3, size=(G, P)),
+        act_quantiles=np.tile(np.array([1., 2., 3., 4., 5.]), (G, 1)),
+        near_threshold_frac=np.full(G, 0.5),
         vocab=['a', 'b', 'c'],
         examples=[[ConceptExample(1.0, 3, 'tok', 'pre', 'post')] for _ in range(G)],
+        bands=[[ConceptBand('top', 4.0, 5.0, 0, 2,
+                            [ConceptExample(5.0, 1, 'hi', 'a', 'b')]),
+                ConceptBand('p50', 2.0, 3.0, 10, 12,
+                            [ConceptExample(2.5, 9, 'lo', 'c', 'd')])]
+               for _ in range(G)],
     )
 
 
@@ -326,3 +333,84 @@ def test_embedding_rejects_unknown_method():
     D = np.zeros((4, 4))
     with pytest.raises(AnalysisError):
         C.embed_distances(D, method='not-a-method', seed=0)
+
+
+# --------------------------------------------------------------------------
+# activation bands / quantiles
+# --------------------------------------------------------------------------
+def test_bands_survive_roundtrip(tmp_path):
+    a = _toy_analysis().validate()
+    p = tmp_path / 'b.npz'
+    a.save(p)
+    b = Analysis.load(p)
+    assert len(b.bands) == a.meta.n_groups
+    assert [x.label for x in b.bands[0]] == ['top', 'p50']
+    assert b.bands[0][0].examples[0].token == 'hi'
+    assert b.bands[0][1].rank_lo == 10
+    np.testing.assert_allclose(b.act_quantiles, a.act_quantiles, rtol=1e-5)
+    np.testing.assert_allclose(b.near_threshold_frac, a.near_threshold_frac, rtol=1e-5)
+
+
+def test_validate_rejects_non_monotonic_quantiles():
+    a = _toy_analysis()
+    a.act_quantiles[1] = [5.0, 4.0, 3.0, 2.0, 1.0]      # descending: invalid
+    with pytest.raises(AnalysisError):
+        a.validate()
+
+
+def test_validate_rejects_wrong_quantile_shape():
+    a = _toy_analysis()
+    a.act_quantiles = np.zeros((a.meta.n_groups, 3))
+    with pytest.raises(ArtifactShapeError):
+        a.validate()
+
+
+def test_validate_rejects_bad_near_threshold_shape():
+    a = _toy_analysis()
+    a.near_threshold_frac = np.zeros(a.meta.n_groups + 2)
+    with pytest.raises(ArtifactShapeError):
+        a.validate()
+
+
+# --------------------------------------------------------------------------
+# concept manifold: the k-dim shortcut must be EXACTLY the d-dim PCA
+# --------------------------------------------------------------------------
+def test_cloud_to_3d_matches_full_dimensional_pca():
+    """Projecting codes through the atoms' SVD must equal PCA of the d-dim cloud.
+
+    build_analysis stores (k,)-dim codes instead of (d,)-dim contributions -- a
+    ~1280x memory saving that is only legitimate if the resulting geometry is
+    identical, up to per-axis sign (PCA axes have arbitrary orientation).
+    """
+    from bsf.analysis.build import _cloud_to_3d
+    from bsf.viz import pca_fit
+    rng = np.random.default_rng(0)
+    n, k, d = 60, 4, 128
+    A = rng.normal(size=(k, d))
+    Z = rng.normal(size=(n, k))
+
+    cheap = _cloud_to_3d(Z, A)
+    C_full = Z @ A                                  # the (n, d) cloud, explicitly
+    mean, comps = pca_fit(C_full, 3)
+    ref = (C_full - mean) @ comps.T
+
+    assert cheap.shape == ref.shape
+    # pairwise distances are basis-independent -> must match exactly
+    def pdist(X):
+        return np.linalg.norm(X[:, None] - X[None], axis=-1)
+    np.testing.assert_allclose(pdist(cheap), pdist(ref), rtol=1e-8, atol=1e-8)
+    # and each axis matches up to sign
+    for j in range(3):
+        assert (np.allclose(cheap[:, j], ref[:, j], atol=1e-8)
+                or np.allclose(cheap[:, j], -ref[:, j], atol=1e-8))
+
+
+def test_cloud_to_3d_handles_rank_deficient_block():
+    """A block whose atoms are linearly dependent must still project cleanly."""
+    from bsf.analysis.build import _cloud_to_3d
+    rng = np.random.default_rng(1)
+    k, d = 4, 32
+    A = rng.normal(size=(k, d))
+    A[3] = A[0] * 2.0                                # rank 3, not 4
+    out = _cloud_to_3d(rng.normal(size=(40, k)), A)
+    assert out.shape == (40, 3) and np.all(np.isfinite(out))

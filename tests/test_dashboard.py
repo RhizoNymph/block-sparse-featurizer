@@ -8,7 +8,8 @@ touching torch.
 import numpy as np
 import pytest
 
-from bsf.analysis.types import Analysis, Meta, ConceptExample, ARTIFACT_VERSION
+from bsf.analysis.types import (Analysis, Meta, ConceptExample, ConceptBand,
+                                ARTIFACT_VERSION)
 
 pytest.importorskip('plotly', reason='dashboard extra not installed')
 
@@ -27,10 +28,23 @@ def _analysis(G=6, k=4, P=8, n_nb=3, dead_last=True):
     manifold = rng.normal(size=(G, P, 3))
     examples = [[ConceptExample(10.0 - i, i, f'tok{i}', 'before ', ' after')
                  for i in range(3)] for _ in range(G)]
+    # concept 0: coherent only at the top (max 100, median 20) -> mostly noise
+    # concept 1: flat profile (max 30, median 28) -> uniformly meaningful
+    quant = np.tile(np.array([15., 18., 20., 25., 100.]), (G, 1))
+    quant[1] = [25., 26., 28., 29., 30.]
+    near = np.full(G, 0.8, dtype=np.float32)
+    near[1] = 0.0
+    bands = [[ConceptBand('top', 90.0, 100.0, 0, 2,
+                          [ConceptExample(100.0, 1, 'sleep', 'could not ', ' well')]),
+              ConceptBand('p50', 19.0, 20.0, 50, 52,
+                          [ConceptExample(20.0, 7, ' the', 'in ', ' room')])]
+             for _ in range(G)]
     if dead_last:
         fire[-1] = 0.0                     # a concept that never fired
         manifold[-1] = 0.0                 # -> no manifold points
         examples[-1] = []                  # -> no examples
+        bands[-1] = []
+        quant[-1] = 0.0
     return Analysis(
         meta=meta,
         embedding=rng.normal(size=(G, 2)),
@@ -45,8 +59,11 @@ def _analysis(G=6, k=4, P=8, n_nb=3, dead_last=True):
         max_act=rng.random(G).astype(np.float32),
         manifold_xyz=manifold.astype(np.float32),
         manifold_token_ids=rng.integers(0, 3, size=(G, P)).astype(np.int32),
+        act_quantiles=quant.astype(np.float32),
+        near_threshold_frac=near,
         vocab=['', 'a', 'b'],
         examples=examples,
+        bands=bands,
     ).validate()
 
 
@@ -113,3 +130,107 @@ def test_token_search_finds_concept():
     assert _find_by_token(an, 'tok1') == 0
     assert _find_by_token(an, 'definitely-not-present') is None
     assert _find_by_token(an, '') is None
+
+
+# --------------------------------------------------------------------------
+# activation-band view
+# --------------------------------------------------------------------------
+def test_act_profile_reports_skew():
+    from bsf.dashboard import figures as F
+    an = _analysis()
+    # concept 0: median 20 of max 100 -> 20% of max, 80% near threshold
+    t = F.act_profile(an, 0).layout.title.text
+    assert 'median is 20% of max' in t
+    assert '80% of firings below 40% of max' in t
+
+
+def test_act_profile_flat_concept_reads_as_healthy():
+    from bsf.dashboard import figures as F
+    t = F.act_profile(_analysis(), 1).layout.title.text
+    assert 'median is 93% of max' in t and '0% of firings below' in t
+
+
+def test_act_profile_empty_for_dead_concept():
+    from bsf.dashboard import figures as F
+    an = _analysis()
+    fig = F.act_profile(an, an.meta.n_groups - 1)
+    assert 'never fired' in str(fig.layout.annotations)
+
+
+def test_bands_block_flags_weak_bands():
+    from bsf.dashboard.app import _bands_block
+    an = _analysis()
+    txt = str(_bands_block(an, 0))
+    # the p50 band sits at 20% of max -> must be marked as likely noise
+    assert 'likely noise' in txt
+    assert 'MEDIAN' in txt and 'TOP' in txt
+
+
+def test_bands_block_does_not_flag_healthy_concept():
+    from bsf.dashboard.app import _bands_block
+    txt = str(_bands_block(_analysis(), 1))
+    assert 'likely noise' not in txt
+
+
+def test_bands_block_handles_missing_bands():
+    from bsf.dashboard.app import _bands_block
+    an = _analysis()
+    txt = str(_bands_block(an, an.meta.n_groups - 1))
+    assert 're-run' in txt
+
+
+def test_app_exposes_band_view_controls():
+    pytest.importorskip('dash', reason='dash not installed')
+    from bsf.dashboard import build_app
+    ids = str(build_app(_analysis()).layout)
+    assert 'act-profile' in ids and 'token-view' in ids
+
+
+# --------------------------------------------------------------------------
+# co-activation edge highlighting
+# --------------------------------------------------------------------------
+def test_connected_returns_partners_strongest_first():
+    from bsf.dashboard.figures import connected
+    an = _analysis()          # edges: (0,1,w=.9) (1,2,w=.5) (3,4,w=.2)
+    p, w = connected(an, 1)
+    assert p.tolist() == [0, 2]                 # both neighbours of 1
+    assert w.tolist() == pytest.approx([0.9, 0.5])
+    assert list(w) == sorted(w, reverse=True)
+
+
+def test_connected_is_symmetric_over_edge_direction():
+    from bsf.dashboard.figures import connected
+    an = _analysis()
+    assert connected(an, 0)[0].tolist() == [1]   # edge stored as (0,1)
+    assert connected(an, 4)[0].tolist() == [3]   # edge stored as (3,4)
+
+
+def test_connected_empty_for_unconnected_concept():
+    from bsf.dashboard.figures import connected
+    an = _analysis()
+    p, w = connected(an, 5)                      # concept 5 has no edges
+    assert p.size == 0 and w.size == 0
+
+
+def test_map_splits_selected_edges_into_own_trace():
+    from bsf.dashboard import figures as F
+    an = _analysis()
+    names = [t.name for t in F.concept_map(an, selected=1).data]
+    assert 'co-firing' in names and 'connected' in names
+    # the accent trace must carry only the 2 edges incident to concept 1
+    conn = [t for t in F.concept_map(an, selected=1).data if t.name == 'connected'][0]
+    assert len(conn.x) == 2 * 3                  # 2 edges x (a, b, None)
+
+
+def test_map_omits_connected_trace_when_selection_has_no_edges():
+    from bsf.dashboard import figures as F
+    an = _analysis()
+    fig = F.concept_map(an, selected=5)
+    assert 'connected' not in [t.name for t in fig.data]
+    assert 'has no edges' in fig.layout.title.text
+
+
+def test_map_title_counts_connected_partners():
+    from bsf.dashboard import figures as F
+    t = F.concept_map(_analysis(), selected=1).layout.title.text
+    assert 'concept 1: 2 connected' in t

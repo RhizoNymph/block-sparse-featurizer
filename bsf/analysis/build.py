@@ -13,7 +13,6 @@ available, so the artifact needs no tokenizer at view time.
 """
 from __future__ import annotations
 
-import heapq
 import json
 import pathlib
 
@@ -23,7 +22,7 @@ import torch
 from .. import capture_format as cf
 from .. import normalize
 from .types import (
-    Analysis, Meta, ConceptExample, ARTIFACT_VERSION,
+    Analysis, Meta, ConceptExample, ConceptBand, ARTIFACT_VERSION,
     AnalysisError, CheckpointMismatchError,
 )
 from . import compute as C
@@ -72,27 +71,26 @@ def _model_from_checkpoint(state, kind, d, n_groups, group_size):
     return model
 
 
-class _TopK:
-    """Bounded min-heap of the strongest (activation, unit, position) triples."""
+def _cloud_to_3d(Z, A):
+    """(n, k) codes + (k, d) decoder block -> (n, 3) PCA of the d-dim cloud.
 
-    def __init__(self, k):
-        self.k = int(k)
-        self.h = []
-
-    def add(self, act, unit, pos):
-        item = (float(act), int(unit), int(pos))
-        if len(self.h) < self.k:
-            heapq.heappush(self.h, item)
-        elif item[0] > self.h[0][0]:
-            heapq.heapreplace(self.h, item)
-
-    def sorted(self):
-        return sorted(self.h, key=lambda t: -t[0])
+    The contributions are ``c_i = z_i A``, so every point lies in the row space of
+    ``A``. Writing ``A = U S Vt`` (rows of ``Vt`` orthonormal in R^d), the
+    coordinates of ``c_i`` in that orthonormal basis are ``y_i = z_i (U S)`` -- and
+    since ``Vt`` is an isometry, PCA of ``y`` in R^k is *identical* to PCA of ``c``
+    in R^d. So the d-dim cloud never has to be materialised.
+    """
+    from ..viz import pca_fit
+    U, S, _ = np.linalg.svd(A, full_matrices=False)       # A: (k, d) -> U (k,k)
+    Y = Z @ (U * S)                                       # (n, k), isometric to c
+    mean, comps = pca_fit(Y, 3)
+    return (Y - mean) @ comps.T
 
 
 def build_analysis(ckpt, root, layer, hook, *, n_groups, group_size,
                    model_kind='group_lasso', requests=300, top_k=12,
                    n_neighbors=8, manifold_points=200, context=4,
+                   band_examples=4, cloud_per_unit=8,
                    embedding_method='graph', coact_threshold=0.1,
                    gguf=None, device=None, seed=0, progress=None):
     """Compute a complete ``Analysis``. Heavy: needs torch, a GPU is advisable."""
@@ -113,11 +111,11 @@ def build_analysis(ckpt, root, layer, hook, *, n_groups, group_size,
     fire_count = torch.zeros(G, dtype=torch.float64, device=device)
     act_sum = torch.zeros(G, dtype=torch.float64, device=device)
     act_max = torch.zeros(G, dtype=torch.float32, device=device)
-    tops = [_TopK(top_k) for _ in range(G)]
     gates = []           # per-unit boolean (n, G), kept on CPU
     clouds = [[] for _ in range(G)]   # (contribution, unit, pos) subsamples
+    # every firing, flat: parallel arrays of (concept, activation, unit, position)
+    fire_con, fire_act, fire_unit, fire_pos = [], [], [], []
     n_tokens = 0
-    rng = np.random.default_rng(seed)
 
     atoms = model.atoms().to(device)                     # (G, k, d)
 
@@ -139,33 +137,41 @@ def build_analysis(ckpt, root, layer, hook, *, n_groups, group_size,
         gates.append(fired.cpu().numpy())
         n_tokens += act.shape[0]
 
-        # Top activations per concept. One batched top-k on the GPU replaces a
-        # per-concept argsort (which made this loop O(G) numpy sorts per unit and
-        # dominated the whole analysis); then a concept is skipped entirely unless
-        # this unit could actually improve its heap or it still needs cloud points.
-        kk = min(int(top_k), act.shape[0])
-        tv, ti = torch.topk(act, kk, dim=0)              # (kk, G)
-        tv_np = tv.cpu().numpy()
-        ti_np = ti.cpu().numpy()
-        unit_max = tv_np[0]                              # (G,) per-concept max here
-        for g in np.nonzero(unit_max > 1e-6)[0]:
-            g = int(g)
-            heap = tops[g]
-            improves = (len(heap.h) < heap.k) or (unit_max[g] > heap.h[0][0])
-            if improves:
-                for r in range(kk):
-                    v = tv_np[r, g]
-                    if v <= 1e-6:
-                        break
-                    heap.add(v, ui, int(ti_np[r, g]))
-            need = manifold_points - len(clouds[g])
-            if need > 0:
-                take = ti_np[:min(kk, need), g]
+        # Record EVERY firing, fully vectorised. With L0 ~ 9 this is ~n*9 rows per
+        # unit (~1.5M over 300 units, ~24MB), which is cheap and buys exact
+        # per-concept activation quantiles -- needed because top-k examples alone
+        # are the extreme tail of a concept's distribution and misrepresent it.
+        # It also removes the per-concept Python loop that used to dominate.
+        nz = torch.nonzero(fired, as_tuple=False)         # (nf, 2) [pos, concept]
+        if nz.numel():
+            fire_pos.append(nz[:, 0].to(torch.int32).cpu().numpy())
+            fire_con.append(nz[:, 1].to(torch.int32).cpu().numpy())
+            fire_act.append(act[fired].to(torch.float32).cpu().numpy())
+            fire_unit.append(np.full(nz.shape[0], ui, dtype=np.int32))
+
+        # Manifold clouds: store the (k,) CODE, never the (d,) contribution.
+        #
+        # Every contribution of concept g is z_g @ atoms_g, so the whole cloud lives
+        # in that concept's own k-dim subspace. Keeping k=4 floats instead of
+        # d=5120 is a ~1280x memory saving (15GB -> 13MB at 300 units) and needs no
+        # per-concept matmul here -- the isometry into 3D is applied once at the
+        # end via the SVD of atoms_g (see _cloud_to_3d).
+        need = np.array([manifold_points - len(c) for c in clouds], dtype=np.int64)
+        if (need > 0).any():
+            cap = min(int(cloud_per_unit), act.shape[0])
+            tv, ti = torch.topk(act, cap, dim=0)          # (cap, G)
+            tv_np, ti_np = tv.cpu().numpy(), ti.cpu().numpy()
+            z_cpu = None
+            for g in np.nonzero((tv_np[0] > 1e-6) & (need > 0))[0]:
+                g = int(g)
+                take = ti_np[:min(cap, int(need[g])), g]
                 take = take[tv_np[:take.size, g] > 1e-6]
-                if take.size:
-                    contrib = (z[take, g, :] @ atoms[g]).cpu().numpy()
-                    for t, c in zip(take, contrib):
-                        clouds[g].append((c, ui, int(t)))
+                if not take.size:
+                    continue
+                if z_cpu is None:
+                    z_cpu = z.cpu().numpy()               # one transfer per unit
+                for t in take:
+                    clouds[g].append((z_cpu[t, g, :].copy(), ui, int(t)))
         if progress is not None:
             progress(ui + 1, len(units))
 
@@ -209,17 +215,65 @@ def build_analysis(ckpt, root, layer, hook, *, n_groups, group_size,
             return f'<{pos}>'
         return clean_token(vocab[ids[pos]])
 
-    examples = []
+    def make_example(act_v, ui, pos):
+        ids = unit_token_ids(ui)
+        lo, hi = max(0, pos - context), min(len(ids), pos + context + 1)
+        before = ''.join(token_str(ui, p) for p in range(lo, pos))
+        after = ''.join(token_str(ui, p) for p in range(pos + 1, hi))
+        return ConceptExample(round(float(act_v), 4), int(pos),
+                              token_str(ui, pos), before, after)
+
+    # ---- group every firing by concept, then cut activation bands
+    #
+    # Bands are rank windows into each concept's firings sorted strongest-first:
+    # 'top' is the usual top-k, while p75/p50/p10 sample progressively closer to
+    # threshold. A concept that is only coherent in 'top' is a concept whose
+    # typical activity means nothing -- which the bands make visible.
+    if fire_con:
+        f_con = np.concatenate(fire_con)
+        f_act = np.concatenate(fire_act)
+        f_unit = np.concatenate(fire_unit)
+        f_pos = np.concatenate(fire_pos)
+    else:
+        f_con = f_act = f_unit = f_pos = np.zeros(0, dtype=np.int32)
+
+    # sort by (concept asc, activation desc) so each concept is a contiguous run
+    order = np.lexsort((-f_act, f_con))
+    f_con, f_act, f_unit, f_pos = (a[order] for a in (f_con, f_act, f_unit, f_pos))
+    starts = np.searchsorted(f_con, np.arange(G), side='left')
+    ends = np.searchsorted(f_con, np.arange(G), side='right')
+
+    BANDS = (('top', 0.0), ('p75', 0.25), ('p50', 0.5), ('p10', 0.9))
+    per_band = max(1, int(band_examples))
+    examples, bands = [], []
+    act_q = np.zeros((G, 5), dtype=np.float32)
+    near_frac = np.zeros(G, dtype=np.float32)
+
     for g in range(G):
-        per = []
-        for act, ui, pos in tops[g].sorted():
-            ids = unit_token_ids(ui)
-            lo, hi = max(0, pos - context), min(len(ids), pos + context + 1)
-            before = ''.join(token_str(ui, p) for p in range(lo, pos))
-            after = ''.join(token_str(ui, p) for p in range(pos + 1, hi))
-            per.append(ConceptExample(round(float(act), 4), int(pos),
-                                      token_str(ui, pos), before, after))
-        examples.append(per)
+        lo, hi = int(starts[g]), int(ends[g])
+        n = hi - lo
+        if n == 0:
+            examples.append([])
+            bands.append([])
+            continue
+        a = f_act[lo:hi]                                  # descending
+        act_q[g] = [a[-1], a[int(0.75 * (n - 1))], a[int(0.5 * (n - 1))],
+                    a[int(0.25 * (n - 1))], a[0]]
+        near_frac[g] = float((a < 0.4 * a[0]).mean())
+        per_concept = []
+        for label, frac in BANDS:
+            s = min(int(frac * n), max(n - 1, 0))
+            e = min(s + per_band, n)
+            exs = [make_example(a[i], int(f_unit[lo + i]), int(f_pos[lo + i]))
+                   for i in range(s, e)]
+            per_concept.append(ConceptBand(
+                label=label, lo_act=round(float(a[e - 1]), 4),
+                hi_act=round(float(a[s]), 4), rank_lo=s, rank_hi=e, examples=exs))
+        bands.append(per_concept)
+        # the token view keeps the usual top-k list
+        k_top = min(int(top_k), n)
+        examples.append([make_example(a[i], int(f_unit[lo + i]), int(f_pos[lo + i]))
+                         for i in range(k_top)])
 
     # ---- concept manifolds: PCA each firing cloud to 3D
     from ..viz import pca_fit
@@ -235,13 +289,13 @@ def build_analysis(ckpt, root, layer, hook, *, n_groups, group_size,
         return tok_index[s]
 
     intern('')
+    atoms_cpu = atoms.detach().cpu().numpy().astype(np.float64)   # (G, k, d)
     for g in range(G):
         pts = clouds[g]
         if len(pts) < 4:
             continue
-        c = np.stack([p[0] for p in pts]).astype(np.float64)
-        m, comps = pca_fit(c, 3)
-        proj = (c - m) @ comps.T
+        Z = np.stack([p[0] for p in pts]).astype(np.float64)      # (n, k) codes
+        proj = _cloud_to_3d(Z, atoms_cpu[g])
         n = min(len(pts), P)
         man_xyz[g, :n] = proj[:n].astype(np.float32)
         for i in range(n):
@@ -270,8 +324,11 @@ def build_analysis(ckpt, root, layer, hook, *, n_groups, group_size,
         max_act=act_max.cpu().numpy().astype(np.float32),
         manifold_xyz=man_xyz,
         manifold_token_ids=man_tok,
+        act_quantiles=act_q,
+        near_threshold_frac=near_frac,
         vocab=tok_table,
         examples=examples,
+        bands=bands,
     ).validate()
 
 
