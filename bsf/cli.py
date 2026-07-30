@@ -13,6 +13,12 @@ Two subcommands:
   ``bsf capture``  drive already-running vLLM servers (launched with
                    ``--capture-consumers filesystem:root=...``) to collect
                    activations to their shared filesystem root.
+
+  ``bsf analyze``  turn a trained checkpoint + capture root into a self-contained
+                   concept-analysis artifact (subspace geometry, statistics,
+                   top-activating tokens, per-concept manifolds).
+
+  ``bsf dashboard``  serve an interactive Dash app over that artifact.
 """
 from __future__ import annotations
 
@@ -109,6 +115,51 @@ def _cmd_capture(args):
 
 
 # ---------------------------------------------------------------------------
+# analyze / dashboard
+# ---------------------------------------------------------------------------
+def _cmd_analyze(args):
+    from .analysis.build import build_analysis
+
+    def progress(done, total):
+        if done % 50 == 0 or done == total:
+            print(f'  [{done}/{total}] units scanned', flush=True)
+
+    an = build_analysis(
+        args.ckpt, args.data, args.layer, args.hook,
+        n_groups=args.n_groups, group_size=args.group_size,
+        model_kind=args.model, requests=args.requests, top_k=args.top_k,
+        n_neighbors=args.neighbors, manifold_points=args.manifold_points,
+        context=args.context, embedding_method=args.embedding,
+        coact_threshold=args.coact_threshold, gguf=args.gguf,
+        device=args.device, seed=args.seed, progress=progress)
+    an.save(args.out)
+    live = int((an.fire_rate > 0).sum())
+    m = an.meta
+    print(f'analysis -> {args.out}\n'
+          f'  {m.n_groups} concepts, {live} fired, '
+          f'{m.n_tokens:,} tokens over {m.n_units} units\n'
+          f'  co-activation graph: {len(an.edges)} edges kept of '
+          f'{m.coact_edges_found} at Jaccard>={m.coact_threshold:g}\n'
+          f'  chordal 2D variance: {m.chordal_2d_variance*100:.2f}% '
+          f'({m.chordal_dims_for_half} dims for 50%) -- why the map uses the graph')
+    return 0
+
+
+def _cmd_dashboard(args):
+    from .analysis import Analysis
+    from .dashboard import build_app
+
+    an = Analysis.load(args.analysis)
+    app = build_app(an)
+    print(f'serving layer {an.meta.layer} ({an.meta.n_groups} concepts) on '
+          f'http://{args.host}:{args.port}\n'
+          f'  over SSH:  ssh -L {args.port}:localhost:{args.port} <host>',
+          flush=True)
+    app.run(host=args.host, port=args.port, debug=args.debug)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # arg parsing
 # ---------------------------------------------------------------------------
 def _add_train_args(p):
@@ -169,11 +220,53 @@ def _add_capture_args(p):
     p.add_argument('--capture-wait', action=argparse.BooleanOptionalAction, default=True)
 
 
+def _add_analyze_args(p):
+    p.add_argument('--ckpt', required=True, help='trained featurizer checkpoint')
+    p.add_argument('--data', required=True, help='vLLM filesystem capture root')
+    p.add_argument('--layer', type=int, required=True)
+    p.add_argument('--hook', default='post_block')
+    p.add_argument('--model', choices=['vanilla', 'grassmannian', 'group_lasso'],
+                   default='group_lasso')
+    p.add_argument('--n-groups', type=int, required=True)
+    p.add_argument('--group-size', type=int, default=3)
+    p.add_argument('--out', required=True, help='output .npz artifact')
+    p.add_argument('--requests', type=int, default=300,
+                   help='capture units (requests) to scan')
+    p.add_argument('--top-k', type=int, default=12,
+                   help='top-activating examples kept per concept')
+    p.add_argument('--neighbors', type=int, default=8,
+                   help='nearest subspaces / co-firing partners kept per concept')
+    p.add_argument('--manifold-points', type=int, default=200,
+                   help='firing-cloud points kept per concept')
+    p.add_argument('--context', type=int, default=4, help='context tokens each side')
+    p.add_argument('--embedding', default='graph',
+                   choices=['graph', 'mds', 'tsne', 'pca'],
+                   help="map layout: 'graph' = spectral layout of the strong "
+                        "co-activation graph (recommended; concept subspaces are "
+                        "near-orthogonal so a chordal-distance map shows <1%% of "
+                        "its variance). mds/tsne/pca embed chordal distance.")
+    p.add_argument('--coact-threshold', type=float, default=0.1,
+                   help='minimum Jaccard overlap for a co-activation edge')
+    p.add_argument('--gguf', default=None,
+                   help='GGUF model file to decode token strings from')
+    p.add_argument('--device', default=None)
+    p.add_argument('--seed', type=int, default=0)
+
+
+def _add_dashboard_args(p):
+    p.add_argument('--analysis', required=True, help='.npz from `bsf analyze`')
+    p.add_argument('--host', default='127.0.0.1')
+    p.add_argument('--port', type=int, default=8050)
+    p.add_argument('--debug', action='store_true')
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog='bsf', description='Block-sparse featurizers')
     sub = parser.add_subparsers(dest='cmd', required=True)
     _add_train_args(sub.add_parser('train', help='train a featurizer'))
     _add_capture_args(sub.add_parser('capture', help='drive vLLM servers to capture activations'))
+    _add_analyze_args(sub.add_parser('analyze', help='build a concept-analysis artifact'))
+    _add_dashboard_args(sub.add_parser('dashboard', help='serve the concept dashboard'))
     return parser
 
 
@@ -181,7 +274,8 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.cmd == 'capture' and not args.hook:
         args.hook = ['post_block']
-    handler = {'train': _cmd_train, 'capture': _cmd_capture}[args.cmd]
+    handler = {'train': _cmd_train, 'capture': _cmd_capture,
+               'analyze': _cmd_analyze, 'dashboard': _cmd_dashboard}[args.cmd]
     return handler(args)
 
 
