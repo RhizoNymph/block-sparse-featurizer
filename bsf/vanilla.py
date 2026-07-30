@@ -33,4 +33,4 @@ class VanillaBSF(BSF):
         target = x if target is None else target
         x_hat, _ = self(x)
         recon = (target - x_hat).pow(2).mean()
-        return recon, {'recon': recon.item()}
+        return recon, {'recon': recon.detach()}

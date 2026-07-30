@@ -23,7 +23,11 @@ dependencies = [
     "matplotlib",
     "einops",
     "transformers",
+    "httpx>=0.27",
 ]
+
+[project.scripts]
+bsf = "bsf.cli:main"
 
 [project.urls]
 Repository = "https://github.com/goodfire-ai/block-sparse-featurizer"
