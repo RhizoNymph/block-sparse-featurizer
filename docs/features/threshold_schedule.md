@@ -108,6 +108,41 @@ numerically unchanged.
    count overstates how many thresholds are genuinely stuck. Treat it as a trend,
    not a census.
 
+## What it bought, measured
+
+Layer 32, 40k held-out tokens from capture units the analysis artifacts never
+touched. `PI` is GroupLasso with `--l0-control 0.002`; `TopK` is `VanillaBSF`
+(`--model vanilla --l0 32`), which fixes L0 by construction and needs none of
+the machinery above.
+
+| | baseline | PI | TopK |
+|---|---|---|---|
+| realized L0 (asked for 32) | 8.70 | 31.82 | 32.00 |
+| R^2 | 0.5098 | **0.5685** | 0.5659 |
+| concepts that ever fire | 4066 (99.3%) | 3036 (74.1%) | 3068 (74.9%) |
+| concepts with >=400 firings | 67 | **674** | **1067** |
+
+Reconstruction improves ~11% *while running at 3.7x the sparsity budget*, and
+the number of concepts with enough firings to say anything statistically
+meaningful about goes up 10-16x. The cost is real: ~25% of the dictionary goes
+silent, measured over 40k tokens rather than the 10-batch eval.
+
+Two other metrics moved (band coherence, within-block anisotropy) but are
+**confounded by L0** — at 3.7x the firings per concept the added firings are the
+marginal ones near threshold, which moves both regardless of concept quality.
+They are not evidence either way and are not reported as results.
+
+PI and TopK land in the same place on every measure. Prefer **TopK** for new
+concept work: it holds the operating point by construction and has none of the
+failure modes this document exists to describe. The fixes here still matter as a
+correctness fix — `--target-l0` silently doing nothing is a bug whichever
+featurizer you choose.
+
+Dictionary size trades reconstruction against dead concepts on a steep curve
+(block-TopK, l0=32, same data): G=1024 -> R^2 0.494 with 2.9% dead; G=2048 ->
+0.521 with 11.8%; G=4096 -> 0.548 with 25.2%. None of that was visible before
+the operating point was pinned.
+
 ## Capture-side row filter
 Position 0 of a sequence is an attention sink; its residual-stream norm is a
 large outlier that is not a concept. On layer 32 of `pile25m`:
