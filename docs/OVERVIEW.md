@@ -59,6 +59,16 @@ Features Index:
     entry_points: [bsf.train.fit, bsf.distributed, bsf.group_lasso]
     depends_on: [activation_sources]
     doc: docs/features/distributed_training.md
+  threshold_schedule:
+    description: >
+      Keeps GroupLasso's learned block threshold trainable for a whole run. The
+      gate compares block norms to theta in units of a running norm scale, so the
+      STE window cannot drift off the distribution and freeze (it did: 79% of
+      blocks had zero threshold gradient, and L0 landed at 7.9 against a target
+      of 32). Adds window/L0 diagnostics and a capture-side attention-sink filter.
+    entry_points: [bsf.group_lasso.BlockJumpReLU, bsf.group_lasso.window_occupancy, bsf.train.l0_off_target, bsf.sources.CapturesSource, bsf.normalize]
+    depends_on: [activation_sources, distributed_training]
+    doc: docs/features/threshold_schedule.md
   concept_dashboard:
     description: >
       `bsf analyze` + `bsf dashboard` -- interactive exploration of learned

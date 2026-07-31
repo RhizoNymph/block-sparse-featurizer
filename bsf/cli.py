@@ -48,7 +48,10 @@ def _build_model(args, d):
         return GrassmannianBSF(d, args.n_groups, args.group_size, l0=args.l0)
     return GroupLassoBSF(d, args.n_groups, args.group_size, coef=args.coef,
                          target_l0=args.target_l0, gain=args.gain,
-                         paper_version=args.paper_version, grad_scale=args.grad_scale)
+                         paper_version=args.paper_version, grad_scale=args.grad_scale,
+                         rel_bandwidth=args.rel_bandwidth,
+                         scale_momentum=args.scale_momentum,
+                         l0_control=args.l0_control)
 
 
 def _build_source(args):
@@ -58,10 +61,11 @@ def _build_source(args):
             x = x[x.files[0]]
         return VisionSource(x)
     mean, scale = normalize.load_or_compute(args.data, args.layer, args.hook,
-                                            max_rows=args.stats_max_rows)
+                                            max_rows=args.stats_max_rows,
+                                            drop_first=args.drop_first)
     return CapturesSource(args.data, args.layer, args.hook,
                           shuffle_buffer=args.shuffle_buffer, mean=mean, scale=scale,
-                          seed=args.seed)
+                          seed=args.seed, drop_first=args.drop_first)
 
 
 def _cmd_train(args):
@@ -169,12 +173,25 @@ def _add_train_args(p):
     m.add_argument('--n-groups', type=int, required=True)
     m.add_argument('--group-size', type=int, default=3)
     m.add_argument('--l0', type=int, default=16, help='vanilla/grassmannian block TopK')
-    m.add_argument('--target-l0', type=int, default=16, help='group_lasso init sparsity')
+    m.add_argument('--target-l0', type=int, default=16,
+                   help='group_lasso COLD-START sparsity. It places the initial '
+                        'threshold only; the steady-state L0 is set by --coef '
+                        'against reconstruction. The trainer warns if the two '
+                        'end up more than 2x apart.')
     m.add_argument('--coef', type=float, default=1e-2, help='group_lasso penalty')
     m.add_argument('--gain', type=float, default=10.0)
     m.add_argument('--paper-version', action='store_true')
     m.add_argument('--grad-scale', type=float, default=1.0,
                    help='group_lasso STE theta-grad scale (1.0 is correct for DDP)')
+    m.add_argument('--rel-bandwidth', type=float, default=0.1,
+                   help='group_lasso STE kernel width, in units of the running '
+                        'block-norm scale')
+    m.add_argument('--scale-momentum', type=float, default=0.99,
+                   help='EMA momentum for the running block-norm scale')
+    m.add_argument('--l0-control', type=float, default=0.0,
+                   help='dual-ascent gain holding realized L0 at --target-l0. '
+                        '0 (default) = fixed --coef, in which case --target-l0 '
+                        'only cold-starts the threshold. Try 0.02.')
 
     s = p.add_argument_group('source')
     s.add_argument('--source', choices=['vision', 'captures'], default='captures')
@@ -185,6 +202,10 @@ def _add_train_args(p):
     s.add_argument('--hook', default='post_block', help='captures: hook name')
     s.add_argument('--num-workers', type=int, default=4)
     s.add_argument('--shuffle-buffer', type=int, default=1 << 16)
+    s.add_argument('--drop-first', type=int, default=0,
+                   help='captures: skip the first N sequence positions of every '
+                        'request. Position 0 is an attention sink whose residual '
+                        'norm is ~4.5x the rest; --drop-first 1 removes it.')
     s.add_argument('--stats-max-rows', type=int, default=None,
                    help='captures: cap rows scanned when computing norm stats')
 

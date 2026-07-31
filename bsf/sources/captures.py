@@ -41,11 +41,18 @@ def _to_fp32(arr, logical_dtype_is_bf16):
 
 class CapturesDataset(IterableDataset):
     def __init__(self, root, layer, hook, *, shuffle_buffer=1 << 16,
-                 mean=None, scale=1.0, seed=0):
+                 mean=None, scale=1.0, seed=0, drop_first=0):
         self.root = root
         self.layer = layer
         self.hook = hook
         self.shuffle_buffer = int(shuffle_buffer)
+        if int(drop_first) < 0:
+            raise ValueError(f'drop_first must be >= 0, got {drop_first}')
+        # One read unit holds one request, in sequence order, so this drops the
+        # first `drop_first` sequence positions. Position 0 is an attention sink:
+        # on layer 32 of pile25m its residual norm is ~4.5x the rest, putting
+        # 0.17% of rows into 17% of the top-1% norm tail.
+        self.drop_first = int(drop_first)
         self.mean = mean if mean is None else torch.as_tensor(mean, dtype=torch.float32)
         self.scale = float(scale)
         self.seed = int(seed)
@@ -79,8 +86,9 @@ class CapturesDataset(IterableDataset):
         cap = self.shuffle_buffer
         for unit in my_units:
             arr = unit.read(self.layer, self.hook)
-            if arr.shape[0] == 0:
+            if arr.shape[0] <= self.drop_first:
                 continue
+            arr = arr[self.drop_first:]
             rows = self._normalize(_to_fp32(arr, arr.dtype == np.uint16))
             for r in rows:
                 if len(buf) < cap:
@@ -98,7 +106,7 @@ class CapturesSource(ActivationSource):
     is_iterable = True
 
     def __init__(self, root, layer, hook, *, shuffle_buffer=1 << 16,
-                 mean=None, scale=1.0, seed=0):
+                 mean=None, scale=1.0, seed=0, drop_first=0):
         self.root = root
         self.layer = layer
         self.hook = hook
@@ -106,9 +114,11 @@ class CapturesSource(ActivationSource):
         self._mean = mean
         self._scale = scale
         self.seed = seed
+        self.drop_first = int(drop_first)
         # infer d from the first non-empty unit's metadata via a cheap read.
         self._ds = CapturesDataset(root, layer, hook, shuffle_buffer=shuffle_buffer,
-                                   mean=mean, scale=scale, seed=seed)
+                                   mean=mean, scale=scale, seed=seed,
+                                   drop_first=drop_first)
         self.d = self._infer_d()
 
     def _infer_d(self):
@@ -126,4 +136,6 @@ class CapturesSource(ActivationSource):
         return self._mean, self._scale
 
     def num_rows(self):
-        return sum(u.count(self.layer, self.hook) for u in self._ds.units)
+        # must match what __iter__ yields: steps_per_epoch is derived from this.
+        return sum(max(u.count(self.layer, self.hook) - self.drop_first, 0)
+                   for u in self._ds.units)
