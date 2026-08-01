@@ -8,7 +8,9 @@ dead-block tracker, and the wiring into `VanillaBSF`.
 - The operating point itself — see `docs/features/threshold_schedule.md`. Dead
   blocks are the *cost* identified there, not its cause.
 - `GroupLassoBSF` / `GrassmannianBSF`. The mixin is featurizer-agnostic and would
-  drop into either, but only the block-TopK path is wired and measured.
+  drop into either, but only the block-TopK path is wired and measured. Wiring it
+  into GroupLasso is the obvious next step: the PI-controlled model produces
+  better features (see `threshold_schedule.md`) and still has 281 silent blocks.
 
 ## The problem
 

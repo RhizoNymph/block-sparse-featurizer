@@ -134,11 +134,38 @@ Two other metrics moved (band coherence, within-block anisotropy) but are
 marginal ones near threshold, which moves both regardless of concept quality.
 They are not evidence either way and are not reported as results.
 
-PI and TopK land in the same place on every measure. Prefer **TopK** for new
-concept work: it holds the operating point by construction and has none of the
-failure modes this document exists to describe. The fixes here still matter as a
-correctness fix — `--target-l0` silently doing nothing is a bug whichever
-featurizer you choose.
+PI and TopK land in the same place on *reconstruction*. They do not on feature
+quality, and the difference favours the learned threshold — see below.
+
+### Which gate to prefer: the threshold, because it can decline
+
+Measured on 300-request analysis artifacts (185k tokens), the distribution of a
+concept's own activations:
+
+| | live | median firing / own max | concepts <40% of max | near-threshold frac |
+|---|---|---|---|---|
+| baseline (L0 8.7) | 4096/4096 | 0.352 | 68.1% | 0.634 |
+| **PI GroupLasso (L0 31.8)** | 3815/4096 | **0.420** | **47.2%** | **0.464** |
+| TopK + revival (L0 32) | 4096/4096 | 0.196 | 97.5% | 0.900 |
+
+The PI-controlled threshold beats **both** the baseline and TopK, and it is the
+only one of the three that improved on the first run. Qualitatively the gap is
+larger than the numbers suggest: PI concepts hold their meaning down the bands
+(concept 3419 is `' derivative'` from its maximum of 151.6 all the way to 89.8;
+3178 is sulfur chemistry; 2372 is relative pronouns `who`/`which`/`whose`),
+where TopK concepts degrade to function words below the top ~2%.
+
+The cause is structural, not a training artifact. **TopK cannot decline.** Every
+token gets exactly `l0` concepts whether or not `l0` concepts apply, so the
+marginal firings are "the 32nd best block for this token", which is close to
+arbitrary. A learned threshold can stay silent, and that is what buys the clean
+activation distribution.
+
+Prefer the **PI-controlled GroupLasso** for interpretability work. TopK remains
+the right choice when a bit-exact operating point matters more than the tail, and
+is far simpler. Its remaining cost here is 281 silent blocks (6.9%), which the
+auxiliary revival loss (`docs/features/revival.md`) should close — it is wired
+for `VanillaBSF` only so far.
 
 Dictionary size trades reconstruction against dead concepts on a steep curve
 (block-TopK, l0=32, same data): G=1024 -> R^2 0.494 with 2.9% dead; G=2048 ->
