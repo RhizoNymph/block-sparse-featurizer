@@ -32,6 +32,19 @@ def recon_r2(model, x):
     return float(1.0 - ss_res / ss_tot.clamp_min(1e-12))
 
 
+def l0_off_target(realized, target, tol=2.0):
+    """Is the realized mean L0 more than ``tol``x away from what was asked for?
+
+    The shipped layer-32 run requested ``--target-l0 32`` and realized 7.9 while
+    logging L0 every epoch: the number was printed but never compared, so a 4x
+    miss looked like a normal training curve. ``None`` target -> never off.
+    """
+    if target is None or target <= 0:
+        return False
+    r = max(float(realized), 1e-9)
+    return r > tol * target or r < target / tol
+
+
 @torch.no_grad()
 def l0_dead(model, x):
     """Mean active blocks per token, and number of blocks that never fire."""
@@ -144,6 +157,30 @@ def _steps_per_epoch(source, batch_size, info, override):
 
 
 @torch.no_grad()
+def _sync_norm_scale(model, info):
+    """Make the running block-norm scale exactly equal on every rank.
+
+    It is EMA'd from each rank's own batches inside the gate (no collective in
+    the hot path, so torch.compile sees no graph break). Left alone the ranks
+    would slowly diverge and gate differently; an all-reduced mean every
+    ``scale_sync_every`` steps bounds the drift to that interval.
+    """
+    if not info.distributed or not hasattr(model, 'norm_scale'):
+        return
+    s = model.norm_scale.clone()
+    all_reduce_sum(s, info)
+    model.norm_scale.copy_(s / info.world_size)
+
+
+@torch.no_grad()
+def _window_report(model, xb):
+    """STE-window diagnostics, or None for featurizers without a learned gate."""
+    if not hasattr(model, 'window_stats'):
+        return None
+    return model.window_stats(xb)
+
+
+@torch.no_grad()
 def _evaluate(model, loader, device, info, eval_steps):
     """Reduced metrics across ranks: (R2, mean L0, dead-block count).
 
@@ -180,7 +217,7 @@ def _evaluate(model, loader, device, info, eval_steps):
 
 def fit(model, source, *, epochs=40, lr=4e-4, batch_size=2048, snr=0.1,
         device=None, log_every=5, steps_per_epoch=None, num_workers=4,
-        compile=False, out=None, seed=0, eval_steps=10):
+        compile=False, out=None, seed=0, eval_steps=10, scale_sync_every=50):
     """Train `model` on an `ActivationSource`. DDP-aware (single process when not
     launched under torchrun). Returns the trained model.
 
@@ -219,6 +256,7 @@ def fit(model, source, *, epochs=40, lr=4e-4, batch_size=2048, snr=0.1,
 
         running = torch.zeros((), device=device)
         nb = 0
+        last_xb = None
         for step, batch in enumerate(loader):
             if step >= spe:
                 break
@@ -229,15 +267,37 @@ def fit(model, source, *, epochs=40, lr=4e-4, batch_size=2048, snr=0.1,
             loss.backward()
             opt.step()
             model.normalize_decoder()
+            if scale_sync_every and step % scale_sync_every == 0:
+                _sync_norm_scale(model, info)
             running += loss.detach()
             nb += 1
+            last_xb = xb_in
 
         if ep == 1 or ep == epochs or ep % log_every == 0:
             r2, l0, dead = _evaluate(model, loader, device, info, eval_steps)
+            win = _window_report(model, last_xb) if last_xb is not None else None
             if info.is_main:
                 avg = float(running / max(nb, 1))
+                extra = ''
+                if win is not None:
+                    extra = (f'   win={win["in_window"] * 100:.3f}%'
+                             f'   frozen={win["dead_blocks"]}/{model.n_groups}')
+                if getattr(model, 'l0_control', 0):
+                    extra += f'   coef={float(model.effective_coef()):.3e}'
                 print(f'epoch {ep:3d}/{epochs}   loss={avg:.4f}   R2={r2:.4f}   '
-                      f'L0={l0:.1f}   dead={dead}/{model.n_groups}', flush=True)
+                      f'L0={l0:.1f}   dead={dead}/{model.n_groups}{extra}',
+                      flush=True)
+                target = getattr(model, 'target_l0', None)
+                if l0_off_target(l0, target):
+                    print(f'  WARNING: realized L0 {l0:.1f} is off target_l0='
+                          f'{target} by more than 2x. `target_l0` only sets the '
+                          f'cold-start threshold; the operating point is set by '
+                          f'`coef` against reconstruction — retune it.',
+                          flush=True)
+                if win is not None and win['dead_blocks'] > 0.5 * model.n_groups:
+                    print(f'  WARNING: {win["dead_blocks"]}/{model.n_groups} blocks '
+                          f'have an empty STE window — their thresholds are '
+                          f'frozen and will not recover.', flush=True)
 
     barrier(info)
     if info.is_main and out is not None:

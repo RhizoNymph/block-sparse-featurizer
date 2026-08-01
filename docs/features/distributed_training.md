@@ -23,9 +23,10 @@ featurizer replica per GPU), no sharding.
    iterable shards can't deadlock a collective.
 4. Eager theta warm-up (GroupLasso default variant only), BEFORE the DDP wrap and
    compile: gather the first batch's block norms across ranks
-   (`all_gather_cat`) and call `init_theta` identically on every rank. `raw_theta`
-   is a Parameter broadcast only at DDP construction, so a per-rank cold-start in
-   the loop would diverge permanently.
+   (`all_gather_cat`) and call `init_theta` identically on every rank -- setting
+   both `raw_theta` and the `norm_scale` buffer from the same global tensor.
+   `raw_theta` is a Parameter broadcast only at DDP construction, so a per-rank
+   cold-start in the loop would diverge permanently.
 5. Wrap `_LossModule(model)` in DDP. **DDP wraps the loss forward, not `forward`**
    -- the loop calls `loss()`, and DDP only all-reduces gradients for the pass
    through `DDP.forward`; routing the loss through the wrapper is what arms the
@@ -48,10 +49,14 @@ featurizer replica per GPU), no sharding.
   Verified: `tests/ddp_grad_scale_check.py` shows `max|Δθ.grad| ≈ 3e-8` at
   `grad_scale=1.0` and exactly `×world_size` too large at `grad_scale=world`.
 - **No host syncs in the compiled hot loop**: `loss()` returns 0-dim detached
-  tensors in the info dict (no per-step `.item()`); `bandwidth` is mirrored to a
-  python float (`_bandwidth_f`) so `float(bandwidth)` doesn't graph-break; the
-  init branch reads a python bool (`_theta_inited`), not a GPU tensor.
-  `load_state_dict` re-syncs both mirrors so a resumed model doesn't re-init.
+  tensors in the info dict (no per-step `.item()`); the init branch reads a python
+  bool (`_theta_inited`), not a GPU tensor, and `load_state_dict` re-syncs it so a
+  resumed model doesn't re-init. The STE kernel width is a plain python float
+  applied to already-normalised block norms, so it needs no buffer read either.
+- **Running block-norm scale under DDP**: `norm_scale` is EMA'd from each rank's
+  own batches inside the gate (no collective in the hot path) and exactly
+  re-synced by `_sync_norm_scale` every `scale_sync_every` steps (default 50).
+  See `docs/features/threshold_schedule.md`.
 - **Grassmannian** does `torch.linalg.qr` every forward -- a known, accepted
   compile graph break (left as-is in Phase 1).
 
@@ -72,8 +77,8 @@ DDP knobs come from torchrun env vars, never CLI flags.
   `_warmup_theta`, `_build_loader`, `_steps_per_epoch`, `_evaluate`.
 - `bsf/distributed.py` -- `init_dist`, `cleanup_dist`, `barrier`,
   `all_reduce_sum/max`, `broadcast`, `all_gather_cat`, `env_rank_world`.
-- `bsf/group_lasso.py` -- `grad_scale`, `_bandwidth_f`/`_theta_inited` mirrors,
-  `load_state_dict` sync.
+- `bsf/group_lasso.py` -- `grad_scale`, `_theta_inited` mirror, `norm_scale`
+  buffer, `load_state_dict` sync.
 - `tests/test_fit_smoke.py`, `tests/ddp_grad_scale_check.py` (run under torchrun).
 
 ## Invariants / constraints

@@ -65,14 +65,38 @@ inside each (k, k) tile — one matmul plus a chunked reduction.
 | variance captured by 2 dims | 0.63% |
 | dims needed for 50% of variance | 276 |
 
-With `G*k = 16384 > d = 5120` the dictionary is overcomplete, so the subspaces
-are *forced* near-orthogonal: random 4-planes in R^5120 have expected
-`cos^2 theta ~ 16/5120`, giving distance ~1.997 — exactly what is observed. Any
-2D projection of that metric is a blob that merely *looks* like structure, so it
-is not the default. Co-activation is likewise near-uniform globally (median
-Jaccard distance 1.0) but its **tail is real**: ~8400 pairs above Jaccard 0.1 and
-~800 above 0.3. A sparse graph of those strong relations does have community
-structure, so `--embedding graph` (the default) lays out that graph spectrally.
+**The cause is concentration of measure, not overcompleteness.** For two random
+k-planes in R^d, `E||Q_i^T Q_j||_F^2 = k^2/d`, so `E[dist^2] = k - k^2/d` — a
+formula in which **G does not appear**. At k=4, d=5120 that predicts 1.9992, and
+the dictionary sits there. An earlier version of this document blamed
+`G*k > d`; a sweep at fixed k=4, d=5120 falsifies that directly, since the
+undercomplete point (`G*k = 4096 < d`) is no less degenerate:
+
+| G | G*k vs d | chordal | spread | 2D var |
+|---|---|---|---|---|
+| 4096 | 3.2x over | 1.9989 | 0.10% | 0.31% |
+| 2048 | 1.6x over | 1.9986 | 0.13% | 0.34% |
+| 1024 | **under**complete | 1.9984 | 0.13% | 0.36% |
+
+Projecting the atoms into a lower-dimensional subspace before measuring does not
+rescue it either. It manufactures spread, but the measured distance tracks the
+*random* prediction to four decimals at every scale, so nothing is revealed that
+was not already dimensional artifact:
+
+| projection | measured | random predicts |
+|---|---|---|
+| top-256 decoder PCs | 1.9838 | 1.9843 |
+| top-64 | 1.9364 | 1.9365 |
+| top-16 | 1.7314 | 1.7321 |
+
+So: BSF concept subspaces are statistically indistinguishable from random
+4-planes under chordal distance, at every dictionary size and every projection
+scale tried. Any 2D projection of that metric is a blob that merely *looks* like
+structure, and one built on a projected version would look better while showing
+no more. Co-activation is likewise near-uniform globally (median Jaccard distance
+1.0) but its **tail is real**: ~8400 pairs above Jaccard 0.1 and ~800 above 0.3.
+A sparse graph of those strong relations does have community structure, so
+`--embedding graph` (the default) lays out that graph spectrally.
 
 The chordal **neighbour list** is still kept and shown: its tail is exactly where
 near-duplicate concepts live (the layer-32 "document-initial" family 836 / 1565 /
