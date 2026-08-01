@@ -43,7 +43,9 @@ from .train import train, fit
 # ---------------------------------------------------------------------------
 def _build_model(args, d):
     if args.model == 'vanilla':
-        return VanillaBSF(d, args.n_groups, args.group_size, l0=args.l0)
+        return VanillaBSF(d, args.n_groups, args.group_size, l0=args.l0,
+                          revival_alpha=args.revival_alpha, k_aux=args.k_aux,
+                          dead_after=args.dead_after)
     if args.model == 'grassmannian':
         return GrassmannianBSF(d, args.n_groups, args.group_size, l0=args.l0)
     return GroupLassoBSF(d, args.n_groups, args.group_size, coef=args.coef,
@@ -173,6 +175,15 @@ def _add_train_args(p):
     m.add_argument('--n-groups', type=int, required=True)
     m.add_argument('--group-size', type=int, default=3)
     m.add_argument('--l0', type=int, default=16, help='vanilla/grassmannian block TopK')
+    m.add_argument('--revival-alpha', type=float, default=0.0,
+                   help='vanilla: weight of the auxiliary revival loss, in which '
+                        'the top --k-aux DEAD blocks reconstruct the residual. '
+                        '0 (default) disables it; try 0.03 (1/32).')
+    m.add_argument('--k-aux', type=int, default=None,
+                   help='dead blocks recruited per token by the revival loss '
+                        '(default: --l0)')
+    m.add_argument('--dead-after', type=float, default=1_000_000,
+                   help='tokens of silence before a block counts as dead')
     m.add_argument('--target-l0', type=int, default=16,
                    help='group_lasso COLD-START sparsity. It places the initial '
                         'threshold only; the steady-state L0 is set by --coef '

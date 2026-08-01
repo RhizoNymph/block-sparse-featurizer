@@ -125,7 +125,9 @@ the machinery above.
 Reconstruction improves ~11% *while running at 3.7x the sparsity budget*, and
 the number of concepts with enough firings to say anything statistically
 meaningful about goes up 10-16x. The cost is real: ~25% of the dictionary goes
-silent, measured over 40k tokens rather than the 10-batch eval.
+silent, measured over 40k tokens rather than the 10-batch eval. That cost is
+addressed separately by the auxiliary revival loss
+(`docs/features/revival.md`), which takes the live dictionary back to 100%.
 
 Two other metrics moved (band coherence, within-block anisotropy) but are
 **confounded by L0** — at 3.7x the firings per concept the added firings are the

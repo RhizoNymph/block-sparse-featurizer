@@ -284,6 +284,9 @@ def fit(model, source, *, epochs=40, lr=4e-4, batch_size=2048, snr=0.1,
                              f'   frozen={win["dead_blocks"]}/{model.n_groups}')
                 if getattr(model, 'l0_control', 0):
                     extra += f'   coef={float(model.effective_coef()):.3e}'
+                tracker = getattr(model, 'dead_tracker', None)
+                if tracker is not None:
+                    extra += f'   silent={tracker.n_dead()}/{model.n_groups}'
                 print(f'epoch {ep:3d}/{epochs}   loss={avg:.4f}   R2={r2:.4f}   '
                       f'L0={l0:.1f}   dead={dead}/{model.n_groups}{extra}',
                       flush=True)

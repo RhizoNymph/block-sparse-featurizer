@@ -69,6 +69,16 @@ Features Index:
     entry_points: [bsf.group_lasso.BlockJumpReLU, bsf.group_lasso.window_occupancy, bsf.train.l0_off_target, bsf.sources.CapturesSource, bsf.normalize]
     depends_on: [activation_sources, distributed_training]
     doc: docs/features/threshold_schedule.md
+  revival:
+    description: >
+      Auxiliary loss giving permanently-silent blocks a gradient path back. A
+      block that wins TopK for no token has dz/da = 0 and can never recover on
+      its own; the top-k_aux DEAD blocks reconstruct the residual instead. On
+      layer 32 this took the live dictionary from 74.9% to 100% while improving
+      R2 (0.5659 -> 0.5815).
+    entry_points: [bsf.revival.DeadBlockTracker, bsf.revival.aux_revival_loss, bsf.revival.RevivalMixin, bsf.vanilla.VanillaBSF]
+    depends_on: [threshold_schedule]
+    doc: docs/features/revival.md
   concept_dashboard:
     description: >
       `bsf analyze` + `bsf dashboard` -- interactive exploration of learned
