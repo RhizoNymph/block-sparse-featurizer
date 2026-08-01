@@ -241,3 +241,49 @@ def test_revival_gives_dead_blocks_a_gradient():
     assert dead, 'sanity: some block should be marked dead by now'
     total = sum(float(m.W_enc.grad[:, g * K:(g + 1) * K].abs().sum()) for g in dead)
     assert total > 0.0, 'no dead block received any auxiliary gradient'
+
+
+def test_a_revival_checkpoint_round_trips_through_the_analysis_loader():
+    """`bsf analyze` must load a checkpoint trained WITH revival.
+
+    Such a checkpoint carries `dead_tracker.tokens_since_fired`; a model built
+    with revival off has no such buffer and the load would fail on an
+    unexpected key.
+    """
+    from bsf.analysis.build import _model_from_checkpoint
+    from bsf.vanilla import VanillaBSF
+
+    torch.manual_seed(0)
+    trained = VanillaBSF(D, G, K, l0=2, revival_alpha=1 / 32)
+    sd = trained.state_dict()
+    assert 'dead_tracker.tokens_since_fired' in sd
+
+    model = _model_from_checkpoint(sd, 'vanilla', D, G, K, l0=2)
+    x = torch.randn(4, D)
+    assert torch.equal(model.encode(x), trained.encode(x))
+
+
+def test_topk_analysis_without_l0_is_refused():
+    """l0 is architecture-defining and absent from the checkpoint, so guessing
+    it would silently analyse the model at the wrong sparsity."""
+    from bsf.analysis.build import _model_from_checkpoint
+    from bsf.analysis.types import AnalysisError
+    from bsf.vanilla import VanillaBSF
+
+    torch.manual_seed(0)
+    sd = VanillaBSF(D, G, K, l0=2).state_dict()
+    with pytest.raises(AnalysisError):
+        _model_from_checkpoint(sd, 'vanilla', D, G, K)
+
+
+def test_a_plain_checkpoint_still_round_trips():
+    from bsf.analysis.build import _model_from_checkpoint
+    from bsf.vanilla import VanillaBSF
+
+    torch.manual_seed(0)
+    trained = VanillaBSF(D, G, K, l0=2)
+    sd = trained.state_dict()
+    assert 'dead_tracker.tokens_since_fired' not in sd
+    model = _model_from_checkpoint(sd, 'vanilla', D, G, K, l0=2)
+    x = torch.randn(4, D)
+    assert torch.equal(model.encode(x), trained.encode(x))

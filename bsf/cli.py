@@ -133,11 +133,13 @@ def _cmd_analyze(args):
     an = build_analysis(
         args.ckpt, args.data, args.layer, args.hook,
         n_groups=args.n_groups, group_size=args.group_size,
-        model_kind=args.model, requests=args.requests, top_k=args.top_k,
+        model_kind=args.model, l0=args.l0, requests=args.requests,
+        top_k=args.top_k,
         n_neighbors=args.neighbors, manifold_points=args.manifold_points,
         context=args.context, embedding_method=args.embedding,
         coact_threshold=args.coact_threshold, gguf=args.gguf,
-        device=args.device, seed=args.seed, progress=progress)
+        device=args.device, seed=args.seed, drop_first=args.drop_first,
+        progress=progress)
     an.save(args.out)
     live = int((an.fire_rate > 0).sum())
     m = an.meta
@@ -261,6 +263,11 @@ def _add_analyze_args(p):
                    default='group_lasso')
     p.add_argument('--n-groups', type=int, required=True)
     p.add_argument('--group-size', type=int, default=3)
+    p.add_argument('--l0', type=int, default=None,
+                   help='REQUIRED for --model vanilla/grassmannian: the block '
+                        'TopK the checkpoint was trained with. Not stored in the '
+                        'checkpoint, and a wrong value analyses the model at the '
+                        'wrong sparsity.')
     p.add_argument('--out', required=True, help='output .npz artifact')
     p.add_argument('--requests', type=int, default=300,
                    help='capture units (requests) to scan')
@@ -283,6 +290,10 @@ def _add_analyze_args(p):
                    help='GGUF model file to decode token strings from')
     p.add_argument('--device', default=None)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--drop-first', type=int, default=0,
+                   help='MUST match the value the checkpoint was trained with: '
+                        'it selects the norm statistics and skips the same '
+                        'leading sequence positions')
 
 
 def _add_dashboard_args(p):
