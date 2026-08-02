@@ -48,8 +48,14 @@ def clean_token(tok):
     return tok.replace('Ġ', ' ').replace('Ċ', '\n').replace('ĉ', '\t')
 
 
-def _model_from_checkpoint(state, kind, d, n_groups, group_size):
-    """Instantiate the right featurizer and check its geometry against the ckpt."""
+def _model_from_checkpoint(state, kind, d, n_groups, group_size, l0=None):
+    """Instantiate the right featurizer and check its geometry against the ckpt.
+
+    ``l0`` is required for the TopK-gated featurizers (`vanilla`,
+    `grassmannian`): it is architecture-defining but is NOT stored in the state
+    dict, so a wrong value silently analyses the model at the wrong sparsity.
+    `group_lasso` ignores it -- its threshold lives in the checkpoint.
+    """
     from ..group_lasso import GroupLassoBSF
     from ..grassmannian import GrassmannianBSF
     from ..vanilla import VanillaBSF
@@ -66,7 +72,20 @@ def _model_from_checkpoint(state, kind, d, n_groups, group_size):
            'vanilla': VanillaBSF}.get(kind)
     if cls is None:
         raise AnalysisError(f'unknown model kind {kind!r}')
-    model = cls(d, n_groups, group_size)
+    kw = {}
+    if cls in (VanillaBSF, GrassmannianBSF):
+        if l0 is None:
+            raise AnalysisError(
+                f'model kind {kind!r} gates by block TopK, so --l0 is required: '
+                f'it is not recoverable from the checkpoint and defaulting it '
+                f'would analyse the model at the wrong sparsity')
+        kw['l0'] = int(l0)
+    if cls is VanillaBSF and 'dead_tracker.tokens_since_fired' in state:
+        # Trained with the revival loss, so the checkpoint carries the tracker
+        # buffer. Enable it here only so the buffer exists to load into -- the
+        # analysis never calls `loss`, so the value is irrelevant to the output.
+        kw['revival_alpha'] = 1.0
+    model = cls(d, n_groups, group_size, **kw)
     model.load_state_dict(state)
     return model
 
@@ -88,17 +107,29 @@ def _cloud_to_3d(Z, A):
 
 
 def build_analysis(ckpt, root, layer, hook, *, n_groups, group_size,
-                   model_kind='group_lasso', requests=300, top_k=12,
+                   model_kind='group_lasso', l0=None, requests=300, top_k=12,
                    n_neighbors=8, manifold_points=200, context=4,
                    band_examples=4, cloud_per_unit=8,
                    embedding_method='graph', coact_threshold=0.1,
-                   gguf=None, device=None, seed=0, progress=None):
-    """Compute a complete ``Analysis``. Heavy: needs torch, a GPU is advisable."""
+                   gguf=None, device=None, seed=0, drop_first=0, progress=None):
+    """Compute a complete ``Analysis``. Heavy: needs torch, a GPU is advisable.
+
+    ``drop_first`` must match what the checkpoint was TRAINED with: it selects
+    the norm statistics (a different filter is a different distribution, and the
+    stats are cached under a different key) and skips the same leading positions
+    here. Recorded positions stay absolute, so token lookups remain aligned with
+    the ``prompt_token_ids`` sidecar.
+    """
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    mean, scale = normalize.load_or_compute(root, layer, hook)
+    drop_first = int(drop_first)
+    if drop_first < 0:
+        raise AnalysisError(f'drop_first must be >= 0, got {drop_first}')
+    mean, scale = normalize.load_or_compute(root, layer, hook,
+                                            drop_first=drop_first)
     d = int(np.asarray(mean).shape[0])
     state = torch.load(ckpt, map_location='cpu')
-    model = _model_from_checkpoint(state, model_kind, d, n_groups, group_size)
+    model = _model_from_checkpoint(state, model_kind, d, n_groups, group_size,
+                                   l0=l0)
     model.to(device).eval()
 
     mean_t = torch.as_tensor(mean, dtype=torch.float32, device=device)
@@ -121,8 +152,9 @@ def build_analysis(ckpt, root, layer, hook, *, n_groups, group_size,
 
     for ui, unit in enumerate(units):
         arr = unit.read(layer, hook)
-        if arr.shape[0] == 0:
+        if arr.shape[0] <= drop_first:
             continue
+        arr = arr[drop_first:]
         x = torch.from_numpy(np.array(arr))
         x = (x.view(torch.bfloat16).float() if arr.dtype == np.uint16
              else x.to(torch.float32))
@@ -144,7 +176,9 @@ def build_analysis(ckpt, root, layer, hook, *, n_groups, group_size,
         # It also removes the per-concept Python loop that used to dominate.
         nz = torch.nonzero(fired, as_tuple=False)         # (nf, 2) [pos, concept]
         if nz.numel():
-            fire_pos.append(nz[:, 0].to(torch.int32).cpu().numpy())
+            # +drop_first: positions stay ABSOLUTE so token_str/make_example
+            # index prompt_token_ids correctly.
+            fire_pos.append((nz[:, 0] + drop_first).to(torch.int32).cpu().numpy())
             fire_con.append(nz[:, 1].to(torch.int32).cpu().numpy())
             fire_act.append(act[fired].to(torch.float32).cpu().numpy())
             fire_unit.append(np.full(nz.shape[0], ui, dtype=np.int32))
@@ -171,7 +205,9 @@ def build_analysis(ckpt, root, layer, hook, *, n_groups, group_size,
                 if z_cpu is None:
                     z_cpu = z.cpu().numpy()               # one transfer per unit
                 for t in take:
-                    clouds[g].append((z_cpu[t, g, :].copy(), ui, int(t)))
+                    # absolute position, as for fire_pos
+                    clouds[g].append((z_cpu[t, g, :].copy(), ui,
+                                      int(t) + drop_first))
         if progress is not None:
             progress(ui + 1, len(units))
 
